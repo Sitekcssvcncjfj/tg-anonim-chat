@@ -1,5 +1,4 @@
 import asyncio
-import json
 import logging
 import os
 import time
@@ -41,8 +40,8 @@ if not ADMIN_IDS:
 bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
-reload_waiting_users = set()
 broadcast_waiting_admins = set()
+edit_waiting_admins = {}  # admin_id -> confession_db_id
 
 CONFIG = {
     "cooldown_seconds": 60,
@@ -75,9 +74,11 @@ def format_content_type_label(content_type: str) -> str:
 
 def start_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📩 İtiraf Gönder", callback_data="start_confess")],
-        [InlineKeyboardButton(text="🛡 Destek Kanalı", url=SUPPORT_URL)],
-        [InlineKeyboardButton(text="ℹ️ Nasıl Çalışır?", callback_data="how_it_works")]
+        [InlineKeyboardButton(text="✍️ İtiraf Gönder", callback_data="start_confess")],
+        [
+            InlineKeyboardButton(text="✨ Nasıl Çalışır?", callback_data="how_it_works"),
+            InlineKeyboardButton(text="🛡 Destek", url=SUPPORT_URL),
+        ]
     ])
 
 def admin_panel_keyboard() -> InlineKeyboardMarkup:
@@ -91,7 +92,7 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🚫 Ban Listesi", callback_data="panel_bans"),
         ],
         [
-            InlineKeyboardButton(text="⚙️ Filtre Ayarları", callback_data="panel_filters"),
+            InlineKeyboardButton(text="⚙️ Filtreler", callback_data="panel_filters"),
             InlineKeyboardButton(text="📊 İstatistik", callback_data="panel_stats"),
         ],
         [
@@ -103,6 +104,9 @@ def confession_admin_keyboard(db_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="✅ Onayla", callback_data=f"approve:{db_id}"),
+            InlineKeyboardButton(text="✏️ Düzenle", callback_data=f"edit:{db_id}"),
+        ],
+        [
             InlineKeyboardButton(text="❌ Reddet", callback_data=f"reject:{db_id}"),
         ]
     ])
@@ -111,6 +115,49 @@ def report_keyboard(confession_no: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚨 Şikayet Et", callback_data=f"report:{confession_no}")]
     ])
+
+def premium_user_received(confession_no: int) -> str:
+    return (
+        "╭━━━ ✨ <b>İtiraf Alındı</b> ✨ ━━━╮\n"
+        f"┃ 🆔 Numaran: <code>#{confession_no}</code>\n"
+        "┃ 📬 İçeriğin güvenle alındı\n"
+        "┃ 🛡 Kimliğin anonim kalacak\n"
+        "┃ ⏳ Admin onayından sonra sıraya alınacak\n"
+        "╰━━━━━━━━━━━━━━━━━━━━━━╯"
+    )
+
+def premium_admin_preview(
+    db_id: int,
+    confession_no: int,
+    user_id: int,
+    content_type: str,
+    text: str
+) -> str:
+    preview = escape(text or "(Metinsiz medya)")
+    return (
+        "╔════════════════════╗\n"
+        "║ 📨 <b>YENİ İTİRAF BEKLİYOR</b>\n"
+        "╚════════════════════╝\n\n"
+        f"🗂 <b>DB ID:</b> <code>{db_id}</code>\n"
+        f"🆔 <b>İtiraf No:</b> <code>#{confession_no}</code>\n"
+        f"👤 <b>Gönderen ID:</b> <code>{user_id}</code>\n"
+        f"🎞 <b>Tür:</b> <b>{format_content_type_label(content_type)}</b>\n"
+        f"📡 <b>Hedef:</b> <code>{escape(TARGET_CHANNEL_ID)}</code>\n\n"
+        f"💬 <b>İçerik:</b>\n{preview}"
+    )
+
+def premium_channel_caption(confession_no: int, text: str) -> str:
+    safe = escape(text or "")
+    return (
+        "┏━━━━━━━━━━━━━━━━━━┓\n"
+        "┃ ✨ <b>ANONİM İTİRAF</b>\n"
+        "┗━━━━━━━━━━━━━━━━━━┛\n\n"
+        f"🆔 <b>No:</b> <code>#{confession_no}</code>\n"
+        "┄┄┄┄┄┄┄┄┄┄\n"
+        f"{safe}\n"
+        "┄┄┄┄┄┄┄┄┄┄\n"
+        "🤍 <i>Anonim olarak gönderildi</i>"
+    )
 
 async def send_to_all_admins(text: str, reply_markup=None):
     for admin_id in ADMIN_IDS:
@@ -151,26 +198,12 @@ async def init_db():
         )
         """)
         await db.execute("""
-        CREATE TABLE IF NOT EXISTS broadcasts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            admin_id INTEGER,
-            text TEXT,
-            created_at INTEGER
-        )
-        """)
-        await db.execute("""
         CREATE TABLE IF NOT EXISTS reports (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             confession_no INTEGER,
             reporter_user_id INTEGER,
             reporter_username TEXT,
             created_at INTEGER
-        )
-        """)
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
         )
         """)
         await db.execute("""
@@ -274,14 +307,14 @@ async def get_confession_by_id(db_id: int):
         """, (db_id,))
         return await cur.fetchone()
 
-async def get_confession_by_no(confession_no: int):
+async def update_confession_text(db_id: int, new_text: str):
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("""
-            SELECT id, confession_no, user_id, content_type, text, media_file_id, media_file_unique_id,
-                   status, admin_id, channel_message_id, created_at, updated_at, queued_at, published_at
-            FROM confessions WHERE confession_no=?
-        """, (confession_no,))
-        return await cur.fetchone()
+        await db.execute("""
+            UPDATE confessions
+            SET text=?, updated_at=?
+            WHERE id=?
+        """, (new_text, now_ts(), db_id))
+        await db.commit()
 
 async def set_confession_status(db_id: int, status: str, admin_id: Optional[int] = None):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -381,7 +414,7 @@ async def broadcast_to_all_users(text: str) -> tuple[int, int]:
 
 async def send_confession_to_channel(row: Any):
     db_id, confession_no, user_id, content_type, text, media_file_id, media_file_unique_id, status, admin_id, channel_message_id, created_at, updated_at, queued_at, published_at = row
-    caption = f"📩 <b>Yeni İtiraf #{confession_no}</b>\n\n{escape(text or '')}".strip()
+    caption = premium_channel_caption(confession_no, text or "")
 
     if content_type == "text":
         sent = await bot.send_message(TARGET_CHANNEL_ID, caption, reply_markup=report_keyboard(confession_no))
@@ -397,7 +430,7 @@ async def send_confession_to_channel(row: Any):
         sent = await bot.send_voice(TARGET_CHANNEL_ID, voice=media_file_id, caption=caption, reply_markup=report_keyboard(confession_no))
     elif content_type == "sticker":
         sent = await bot.send_sticker(TARGET_CHANNEL_ID, sticker=media_file_id)
-        await bot.send_message(TARGET_CHANNEL_ID, f"📩 <b>Yeni İtiraf #{confession_no}</b>\n\n{escape(text or '(Sticker itirafı)')}", reply_markup=report_keyboard(confession_no))
+        await bot.send_message(TARGET_CHANNEL_ID, premium_channel_caption(confession_no, text or "(Sticker itirafı)"), reply_markup=report_keyboard(confession_no))
     else:
         sent = await bot.send_message(TARGET_CHANNEL_ID, caption, reply_markup=report_keyboard(confession_no))
 
@@ -405,7 +438,13 @@ async def send_confession_to_channel(row: Any):
     await set_confession_published(db_id, msg_id)
 
     try:
-        await bot.send_message(user_id, f"🚀 İtirafın yayınlandı.\n🆔 İtiraf numaran: <code>#{confession_no}</code>")
+        await bot.send_message(
+            user_id,
+            "╭━━━ 🚀 <b>İtirafın Yayınlandı</b> 🚀 ━━━╮\n"
+            f"┃ 🆔 Numaran: <code>#{confession_no}</code>\n"
+            "┃ 📢 Kanalda başarıyla paylaşıldı\n"
+            "╰━━━━━━━━━━━━━━━━━━━━━━╯"
+        )
     except Exception:
         pass
 
@@ -435,33 +474,39 @@ async def publisher_loop():
 async def start_handler(message: Message):
     await upsert_user(message)
     welcome = (
-        f"👋 <b>Hoş geldin {user_display_name(message)}</b>\n\n"
-        f"Bu bot üzerinden tamamen anonim şekilde itiraf gönderebilirsin.\n"
-        f"Mesajın admin onayından geçer, sonra sıraya alınır ve kanalda paylaşılır.\n\n"
-        f"✨ <b>Destek Kanalı:</b> <a href=\"{SUPPORT_URL}\">buraya tıkla</a>\n\n"
-        f"Aşağıdaki butonları kullanabilirsin."
+        f"✨ <b>Hoş geldin {user_display_name(message)}</b>\n\n"
+        "Anonim itirafını güvenli şekilde gönderebilirsin.\n"
+        "Mesajın admin kontrolünden geçer, sonra yayın sırasına alınır.\n\n"
+        f"🛡 <b>Destek Kanalı:</b> <a href=\"{SUPPORT_URL}\">KGBotomasyon</a>\n"
+        "Aşağıdaki menüyü kullanabilirsin."
     )
     await message.answer(welcome, reply_markup=start_keyboard(), disable_web_page_preview=True)
 
 @dp.callback_query(F.data == "start_confess")
 async def cb_start_confess(callback: CallbackQuery):
     await callback.message.answer(
-        "📩 <b>İtiraf Gönderimi Başladı</b>\n\n"
-        "Bana metin, fotoğraf, video, ses, belge, sticker veya voice gönderebilirsin.\n"
-        "İstersen medyaya açıklama da ekleyebilirsin.\n\n"
-        "Anonim kalacaksın."
+        "✍️ <b>İtiraf Gönderimi</b>\n\n"
+        "Bana şunlardan birini gönderebilirsin:\n"
+        "• Yazı\n"
+        "• Fotoğraf\n"
+        "• Video\n"
+        "• Belge\n"
+        "• Ses / Voice\n"
+        "• Sticker\n\n"
+        "İstersen medyaya açıklama da ekleyebilirsin.\n"
+        "Kimliğin anonim kalır."
     )
     await callback.answer()
 
 @dp.callback_query(F.data == "how_it_works")
 async def cb_how(callback: CallbackQuery):
     await callback.message.answer(
-        "ℹ️ <b>Sistem Nasıl Çalışır?</b>\n\n"
-        "1) Bottan bana içeriğini gönderirsin.\n"
-        "2) Adminler inceler.\n"
-        "3) Onaylanırsa sıraya girer.\n"
-        "4) Kanalda anonim olarak paylaşılır.\n"
-        "5) Kullanıcı kimliğin kanalda görünmez."
+        "✨ <b>Sistem Nasıl Çalışır?</b>\n\n"
+        "1) İçeriğini bana gönderirsin\n"
+        "2) Adminler inceler\n"
+        "3) Gerekirse düzenler\n"
+        "4) Onaylanırsa sıraya alınır\n"
+        "5) Kanalda anonim paylaşılır"
     )
     await callback.answer()
 
@@ -471,20 +516,20 @@ async def help_handler(message: Message):
     if is_admin(message.from_user.id):
         text = (
             "🛠 <b>Admin Komutları</b>\n\n"
-            "/panel - Butonlu admin paneli\n"
-            "/pending - Bekleyen itiraflar\n"
-            "/stats - İstatistikler\n"
-            "/broadcast - Duyuru gönderimi başlatır\n"
-            "/reload - Ayarları yeniden yükler\n"
-            "/ban USER_ID - Kullanıcıyı banlar\n"
-            "/unban USER_ID - Ban kaldırır\n"
-            "/help - Bu yardım mesajı"
+            "/panel - Butonlu panel\n"
+            "/pending - Bekleyenler\n"
+            "/stats - İstatistik\n"
+            "/broadcast - Duyuru modu\n"
+            "/reload - Ayar yenile\n"
+            "/ban USER_ID - Banla\n"
+            "/unban USER_ID - Ban kaldır\n"
+            "/cancel - Bekleyen admin işlemini iptal et"
         )
     else:
         text = (
             "ℹ️ <b>Kullanıcı Yardım</b>\n\n"
             "/start - Başlangıç menüsü\n"
-            "Bana direkt itirafını veya medyanı gönder.\n"
+            "Bana direkt itirafını gönder.\n"
             f"Destek: <a href=\"{SUPPORT_URL}\">KGBotomasyon</a>"
         )
     await message.answer(text, disable_web_page_preview=True)
@@ -656,7 +701,7 @@ async def broadcast_handler(message: Message):
 async def cancel_handler(message: Message):
     await upsert_user(message)
     broadcast_waiting_admins.discard(message.from_user.id)
-    reload_waiting_users.discard(message.from_user.id)
+    edit_waiting_admins.pop(message.from_user.id, None)
     await message.answer("❎ Bekleyen işlem iptal edildi.")
 
 @dp.message(Command("ban"))
@@ -683,6 +728,30 @@ async def unban_handler(message: Message):
     await unban_user(uid)
     await message.answer(f"✅ Kullanıcı banı kaldırıldı: <code>{uid}</code>")
 
+@dp.callback_query(F.data.startswith("edit:"))
+async def edit_confession(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return await callback.answer("Yetkin yok", show_alert=True)
+
+    db_id = int(callback.data.split(":")[1])
+    row = await get_confession_by_id(db_id)
+    if not row:
+        return await callback.answer("İtiraf bulunamadı", show_alert=True)
+
+    if row[7] != "pending":
+        return await callback.answer("Sadece bekleyen itiraf düzenlenebilir", show_alert=True)
+
+    edit_waiting_admins[callback.from_user.id] = db_id
+    current_text = row[4] or ""
+    await callback.message.answer(
+        "✏️ <b>Düzenleme Modu</b>\n\n"
+        f"İtiraf: <code>#{row[1]}</code>\n"
+        "Lütfen yeni metni tek mesaj olarak gönder.\n"
+        "İptal için /cancel yaz.\n\n"
+        f"Mevcut metin:\n<code>{escape(current_text[:1500])}</code>"
+    )
+    await callback.answer("Düzenleme modu açıldı")
+
 @dp.callback_query(F.data.startswith("approve:"))
 async def approve_confession(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -708,15 +777,18 @@ async def approve_confession(callback: CallbackQuery):
     try:
         await bot.send_message(
             user_id,
-            f"✅ İtirafın onaylandı.\n🆔 Numaran: <code>#{confession_no}</code>\nYayın sırasına alındı."
+            "╭━━━ ✅ <b>İtirafın Onaylandı</b> ✅ ━━━╮\n"
+            f"┃ 🆔 Numaran: <code>#{confession_no}</code>\n"
+            "┃ ⏳ Yayın sırasına alındı\n"
+            "╰━━━━━━━━━━━━━━━━━━━━━━╯"
         )
     except Exception:
         pass
 
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.answer(
-        f"✅ İtiraf onaylandı ve yayın kuyruğuna alındı.\n"
-        f"🆔 <code>#{confession_no}</code>"
+        "✅ <b>Onaylandı</b>\n"
+        f"İtiraf <code>#{confession_no}</code> yayın kuyruğuna alındı."
     )
     await callback.answer("Onaylandı")
 
@@ -741,7 +813,9 @@ async def reject_confession(callback: CallbackQuery):
     try:
         await bot.send_message(
             user_id,
-            f"❌ İtirafın reddedildi.\n🆔 Numaran: <code>#{confession_no}</code>"
+            "╭━━━ ❌ <b>İtirafın Reddedildi</b> ❌ ━━━╮\n"
+            f"┃ 🆔 Numaran: <code>#{confession_no}</code>\n"
+            "╰━━━━━━━━━━━━━━━━━━━━━━╯"
         )
     except Exception:
         pass
@@ -763,17 +837,14 @@ async def report_confession(callback: CallbackQuery):
 
     await save_report(confession_no, reporter.id, reporter.username or "")
 
+    username_text = f"@{escape(reporter.username)}" if reporter.username else "yok"
+
     report_text = (
-        f"🚨 <b>Yeni Şikayet</b>\n\n"
-        f"İtiraf No: <code>#{confession_no}</code>\n"
-        f"Şikayet Eden ID: <code>{reporter.id}</code>\n"
-        f"Şikayet Eden: {escape(reporter.first_name or '')}\n"
-        f"Kullanıcı Adı: @{escape(reporter.username)}" if reporter.username else
-        f"🚨 <b>Yeni Şikayet</b>\n\n"
-        f"İtiraf No: <code>#{confession_no}</code>\n"
-        f"Şikayet Eden ID: <code>{reporter.id}</code>\n"
-        f"Şikayet Eden: {escape(reporter.first_name or '')}\n"
-        f"Kullanıcı Adı: yok"
+        "🚨 <b>Yeni Şikayet Geldi</b>\n\n"
+        f"🆔 İtiraf No: <code>#{confession_no}</code>\n"
+        f"👤 Şikayet Eden ID: <code>{reporter.id}</code>\n"
+        f"🙍 Ad: {escape(reporter.first_name or '')}\n"
+        f"🔗 Kullanıcı Adı: {username_text}"
     )
     await send_to_all_admins(report_text)
     await callback.answer("Şikayetin adminlere iletildi.", show_alert=True)
@@ -792,9 +863,71 @@ async def handle_broadcast_message(message: Message) -> bool:
         await message.answer("❌ Duyuru olarak şimdilik sadece metin destekleniyor.")
         return True
 
-    sent, failed = await broadcast_to_all_users(f"📣 <b>Duyuru</b>\n\n{escape(text)}")
+    sent, failed = await broadcast_to_all_users(
+        "╔══════════════╗\n"
+        "║ 📣 <b>DUYURU</b>\n"
+        "╚══════════════╝\n\n"
+        f"{escape(text)}"
+    )
     broadcast_waiting_admins.discard(message.from_user.id)
     await message.answer(f"✅ Duyuru tamamlandı.\nGönderilen: <code>{sent}</code>\nBaşarısız: <code>{failed}</code>")
+    return True
+
+async def handle_edit_message(message: Message) -> bool:
+    admin_id = message.from_user.id
+    if admin_id not in edit_waiting_admins:
+        return False
+    if not is_admin(admin_id):
+        edit_waiting_admins.pop(admin_id, None)
+        return False
+    if message.chat.type != ChatType.PRIVATE:
+        return True
+    if not message.text or message.text.startswith("/"):
+        await message.answer("⚠️ Lütfen yeni metni düz yazı olarak gönder.")
+        return True
+
+    db_id = edit_waiting_admins[admin_id]
+    row = await get_confession_by_id(db_id)
+    if not row:
+        edit_waiting_admins.pop(admin_id, None)
+        await message.answer("❌ İtiraf bulunamadı.")
+        return True
+
+    if row[7] != "pending":
+        edit_waiting_admins.pop(admin_id, None)
+        await message.answer("❌ Bu itiraf artık beklemede değil.")
+        return True
+
+    new_text = message.text.strip()
+    if len(new_text) < 3:
+        await message.answer("⚠️ Yeni metin çok kısa.")
+        return True
+    if len(new_text) > CONFIG["max_text_length"]:
+        await message.answer(f"⚠️ Yeni metin çok uzun. En fazla {CONFIG['max_text_length']} karakter.")
+        return True
+
+    await update_confession_text(db_id, new_text)
+    edit_waiting_admins.pop(admin_id, None)
+
+    confession_no = row[1]
+    user_id = row[2]
+    content_type = row[3]
+
+    await message.answer(
+        "✏️ <b>İtiraf güncellendi</b>\n\n"
+        f"🆔 <code>#{confession_no}</code>\n"
+        "Şimdi yeniden inceleyip onaylayabilirsin."
+    )
+
+    admin_text = premium_admin_preview(
+        db_id=db_id,
+        confession_no=confession_no,
+        user_id=user_id,
+        content_type=content_type,
+        text=new_text
+    )
+
+    await send_to_all_admins(admin_text, reply_markup=confession_admin_keyboard(db_id))
     return True
 
 async def process_confession_submission(message: Message):
@@ -807,6 +940,9 @@ async def process_confession_submission(message: Message):
         return
 
     if await handle_broadcast_message(message):
+        return
+
+    if await handle_edit_message(message):
         return
 
     if await is_banned_user(message.from_user.id):
@@ -875,15 +1011,12 @@ async def process_confession_submission(message: Message):
         media_file_unique_id=media_file_unique_id
     )
 
-    safe_text = escape(text or "(metinsiz medya)")
-    admin_text = (
-        f"📥 <b>Yeni İtiraf Bekliyor</b>\n\n"
-        f"DB ID: <code>{db_id}</code>\n"
-        f"İtiraf No: <code>#{confession_no}</code>\n"
-        f"Gönderen ID: <code>{message.from_user.id}</code>\n"
-        f"Tür: <b>{format_content_type_label(content_type)}</b>\n"
-        f"Hedef Kanal: <code>{escape(TARGET_CHANNEL_ID)}</code>\n\n"
-        f"Mesaj:\n{safe_text}"
+    admin_text = premium_admin_preview(
+        db_id=db_id,
+        confession_no=confession_no,
+        user_id=message.from_user.id,
+        content_type=content_type,
+        text=text
     )
 
     for admin_id in ADMIN_IDS:
@@ -908,16 +1041,13 @@ async def process_confession_submission(message: Message):
         except Exception as e:
             logging.error(f"Admin forward hatası: {e}")
 
-    await message.answer(
-        f"✅ İtirafın alındı.\n🆔 Numaran: <code>#{confession_no}</code>\n"
-        "Admin onayından sonra yayın sırasına girecek."
-    )
+    await message.answer(premium_user_received(confession_no))
 
 @dp.channel_post()
 async def channel_post_handler(message: Message):
     try:
         info_text = (
-            f"📢 <b>Kanal bilgisi alındı</b>\n\n"
+            "📢 <b>Kanal Bilgisi Alındı</b>\n\n"
             f"Kanal adı: {escape(message.chat.title or 'Bilinmiyor')}\n"
             f"Kanal ID: <code>{message.chat.id}</code>"
         )
