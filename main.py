@@ -13,13 +13,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID"))
+ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 TARGET_CHANNEL_ID = os.getenv("TARGET_CHANNEL_ID", "0")
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN eksik")
-if not ADMIN_ID:
-    raise ValueError("ADMIN_ID eksik")
+
+if not ADMIN_IDS:
+    raise ValueError("ADMIN_IDS eksik")
 
 logging.basicConfig(level=logging.INFO)
 
@@ -41,6 +42,9 @@ BANNED_WORDS = [
     "onlyfans",
     "spam",
 ]
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
 
 def is_spam(text: str) -> bool:
     lower_text = text.lower()
@@ -64,12 +68,23 @@ def admin_keyboard(confession_id: str) -> InlineKeyboardMarkup:
         ]
     )
 
+async def send_to_all_admins(text: str, reply_markup=None):
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                chat_id=admin_id,
+                text=text,
+                reply_markup=reply_markup
+            )
+        except Exception as e:
+            logging.error(f"Admin {admin_id} mesaj hatası: {e}")
+
 @dp.message(CommandStart())
 async def start_handler(message: Message):
     await message.answer(
         "👋 Merhaba!\n\n"
         "Bu bot ile anonim itiraf gönderebilirsin.\n"
-        "Gönderdiğin mesaj admin onayına gider.\n"
+        "Mesajın admin onayına gider.\n"
         "Onaylanırsa KANALDA anonim paylaşılır.\n\n"
         "✍️ Bana itirafını gönder."
     )
@@ -110,6 +125,7 @@ async def confession_handler(message: Message):
         "user_id": user_id,
         "text": confession_text,
         "created_at": time.time(),
+        "status": "pending"
     }
 
     safe_text = escape(confession_text)
@@ -122,8 +138,7 @@ async def confession_handler(message: Message):
         f"<b>Mesaj:</b>\n{safe_text}"
     )
 
-    await bot.send_message(
-        chat_id=ADMIN_ID,
+    await send_to_all_admins(
         text=admin_text,
         reply_markup=admin_keyboard(confession_id)
     )
@@ -132,7 +147,7 @@ async def confession_handler(message: Message):
 
 @dp.callback_query(F.data.startswith("approve:"))
 async def approve_confession(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
+    if not is_admin(callback.from_user.id):
         await callback.answer("Yetkin yok.", show_alert=True)
         return
 
@@ -141,6 +156,10 @@ async def approve_confession(callback: CallbackQuery):
 
     if not confession:
         await callback.answer("Bu itiraf bulunamadı veya zaten işlendi.", show_alert=True)
+        return
+
+    if confession.get("status") != "pending":
+        await callback.answer("Bu itiraf zaten işlendi.", show_alert=True)
         return
 
     if TARGET_CHANNEL_ID == "0":
@@ -161,11 +180,16 @@ async def approve_confession(callback: CallbackQuery):
             chat_id=TARGET_CHANNEL_ID,
             text=public_text
         )
+
+        confession["status"] = "approved"
+        confession["approved_by"] = callback.from_user.id
+
         await callback.message.edit_reply_markup(reply_markup=None)
         await callback.message.answer(
             f"✅ İtiraf onaylandı ve KANALA gönderildi.\n"
             f"ID: <code>{confession_id}</code>"
         )
+
         pending_confessions.pop(confession_id, None)
         await callback.answer("Onaylandı.")
     except Exception as e:
@@ -177,7 +201,7 @@ async def approve_confession(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("reject:"))
 async def reject_confession(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
+    if not is_admin(callback.from_user.id):
         await callback.answer("Yetkin yok.", show_alert=True)
         return
 
@@ -188,22 +212,30 @@ async def reject_confession(callback: CallbackQuery):
         await callback.answer("Bu itiraf bulunamadı veya zaten işlendi.", show_alert=True)
         return
 
-    pending_confessions.pop(confession_id, None)
+    if confession.get("status") != "pending":
+        await callback.answer("Bu itiraf zaten işlendi.", show_alert=True)
+        return
+
+    confession["status"] = "rejected"
+    confession["rejected_by"] = callback.from_user.id
+
     await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.answer(f"❌ İtiraf reddedildi.\nID: <code>{confession_id}</code>")
+    await callback.message.answer(
+        f"❌ İtiraf reddedildi.\nID: <code>{confession_id}</code>"
+    )
+
+    pending_confessions.pop(confession_id, None)
     await callback.answer("Reddedildi.")
 
 @dp.channel_post()
 async def channel_post_handler(message: Message):
     try:
-        await bot.send_message(
-            chat_id=ADMIN_ID,
-            text=(
-                f"📢 <b>Kanal bilgisi alındı</b>\n\n"
-                f"<b>Kanal adı:</b> {escape(message.chat.title or 'Bilinmiyor')}\n"
-                f"<b>Kanal ID:</b> <code>{message.chat.id}</code>"
-            )
+        info_text = (
+            f"📢 <b>Kanal bilgisi alındı</b>\n\n"
+            f"<b>Kanal adı:</b> {escape(message.chat.title or 'Bilinmiyor')}\n"
+            f"<b>Kanal ID:</b> <code>{message.chat.id}</code>"
         )
+        await send_to_all_admins(info_text)
     except Exception as e:
         logging.error(f"Kanal bilgisi gönderilemedi: {e}")
 
