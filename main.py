@@ -14,7 +14,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
-TARGET_CHANNEL_ID = int(os.getenv("TARGET_CHANNEL_ID", "0"))
+TARGET_CHANNEL_ID = os.getenv("TARGET_CHANNEL_ID", "0")
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN eksik")
@@ -117,7 +117,8 @@ async def confession_handler(message: Message):
     admin_text = (
         f"📥 <b>Yeni İtiraf Bekliyor</b>\n\n"
         f"<b>ID:</b> <code>{confession_id}</code>\n"
-        f"<b>Gönderen Kullanıcı ID:</b> <code>{user_id}</code>\n\n"
+        f"<b>Gönderen Kullanıcı ID:</b> <code>{user_id}</code>\n"
+        f"<b>Hedef Kanal:</b> <code>{escape(TARGET_CHANNEL_ID)}</code>\n\n"
         f"<b>Mesaj:</b>\n{safe_text}"
     )
 
@@ -142,7 +143,7 @@ async def approve_confession(callback: CallbackQuery):
         await callback.answer("Bu itiraf bulunamadı veya zaten işlendi.", show_alert=True)
         return
 
-    if TARGET_CHANNEL_ID == 0:
+    if TARGET_CHANNEL_ID == "0":
         await callback.message.answer("❌ TARGET_CHANNEL_ID ayarlanmamış.")
         await callback.answer("Hata", show_alert=True)
         return
@@ -168,6 +169,7 @@ async def approve_confession(callback: CallbackQuery):
         pending_confessions.pop(confession_id, None)
         await callback.answer("Onaylandı.")
     except Exception as e:
+        logging.exception("Kanal gönderim hatası")
         await callback.message.answer(
             f"❌ Kanal gönderim hatası:\n<code>{escape(str(e))}</code>"
         )
@@ -187,14 +189,10 @@ async def reject_confession(callback: CallbackQuery):
         return
 
     pending_confessions.pop(confession_id, None)
-
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.answer(f"❌ İtiraf reddedildi.\nID: <code>{confession_id}</code>")
     await callback.answer("Reddedildi.")
 
-# Kanal ID öğrenmek için:
-# Bot kanala admin olarak ekliyse ve kanalda yeni post atılırsa,
-# bot admin'e kanal id'yi yollar.
 @dp.channel_post()
 async def channel_post_handler(message: Message):
     try:
