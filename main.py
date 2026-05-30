@@ -1060,6 +1060,10 @@ async def all_private_content_handler(message: Message):
     await process_confession_submission(message)
 
 async def main():
+    await bot.delete_webhook(drop_pending_updates=True)  # <-- EKLE
+    await init_db()
+    ...
+    await dp.start_polling(bot)
     await bot.delete_webhook(drop_pending_updates=True)  # <-- bunu ekle
     await init_db()
     ...
@@ -1070,6 +1074,3 @@ async def main():
     CONFIG["auto_publish"] = os.getenv("AUTO_PUBLISH", "true").lower() == "true"
     asyncio.create_task(publisher_loop())
     await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
