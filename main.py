@@ -1060,6 +1060,10 @@ async def all_private_content_handler(message: Message):
     await process_confession_submission(message)
 
 async def main():
+    await bot.delete_webhook(drop_pending_updates=True)  # <-- bunu ekle
+    await init_db()
+    ...
+    await dp.start_polling(bot)
     await init_db()
     CONFIG["cooldown_seconds"] = int(os.getenv("COOLDOWN_SECONDS", "60"))
     CONFIG["max_text_length"] = int(os.getenv("MAX_TEXT_LENGTH", "3000"))
